@@ -1,0 +1,36 @@
+name: Node.js CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+env:
+  SQL_HOST: ${{ secrets.SQL_HOST }}
+  SQL_PORT: ${{ secrets.SQL_PORT }}
+  SQL_USER: ${{ secrets.SQL_USER }}
+  SQL_PASS: ${{ secrets.SQL_PASS }}
+
+jobs:
+
+  remove-feature-db:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Retrieve database name of the feature branch
+      id: db_name
+      run: |
+        PR_BRANCH=${{ github.event.pull_request.head.ref }}
+        SQL_DB="${PR_BRANCH//[^[:alnum:]]/_}"
+        echo "Sanitized Branch Name: $SQL_DB"
+        echo "SQL_DB=$SQL_DB" >> $GITHUB_ENV
+
+    - name: Remove database instance
+      run: |
+        # Drop database and immediately create a new one
+        mysql -h $SQL_HOST -P $SQL_PORT -u $SQL_USER -p$SQL_PASS -e "DROP DATABASE IF EXISTS $SQL_DB;"

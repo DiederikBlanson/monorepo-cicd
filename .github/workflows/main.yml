@@ -1,0 +1,311 @@
+name: Node.js CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SQL_HOST: ${{ secrets.SQL_HOST }}
+  SQL_PORT: ${{ secrets.SQL_PORT }}
+  SQL_USER: ${{ secrets.SQL_USER }}
+  SQL_PASS: ${{ secrets.SQL_PASS }}
+
+jobs:
+
+  initialize-db:
+    runs-on: ubuntu-latest
+    outputs:
+      SQL_DB: ${{ steps.db_name.outputs.SQL_DB }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Retrieve database name
+      id: db_name
+      run: |
+        PR_BRANCH=${{ github.event.pull_request.head.ref }}
+        SQL_DB="${PR_BRANCH//[^[:alnum:]]/_}"
+        echo "Sanitized Branch Name: $SQL_DB"
+        echo "SQL_DB=$SQL_DB" >> $GITHUB_ENV
+        echo "SQL_DB=$SQL_DB" >> $GITHUB_OUTPUT
+
+    - name: Cleanup MySQL Database
+      run: |
+        # Drop database and immediately create a new one
+        mysql -h $SQL_HOST -P $SQL_PORT -u $SQL_USER -p$SQL_PASS -e "DROP DATABASE IF EXISTS $SQL_DB; CREATE DATABASE $SQL_DB;"
+    
+    - name: Setup MySQL Database
+      run: |
+        # Use the environment variables to connect to the database
+        mysql -h $SQL_HOST -P $SQL_PORT -u $SQL_USER -p$SQL_PASS -D $SQL_DB -e "source db/struc.sql;" 
+
+
+
+  frontend-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Restore 'node_modules'
+      id: frontend-react-restore
+      uses: actions/cache/restore@v3
+      with:
+        path: frontend/app/node_modules
+        key: ${{ runner.os }}-${{ hashFiles('frontend/app/package.json') }}
+
+    - name: Install dependencies 
+      working-directory: frontend/app
+      run: npm install
+
+    - name: Cache 'node_modules'
+      id: frontend-react-save
+      uses: actions/cache/save@v3
+      with:
+        path: frontend/app/node_modules
+        key:  ${{ runner.os }}-${{ hashFiles('frontend/app/package.json') }}
+
+    - name: Build frontend 
+      working-directory: frontend/app
+      run: npm run build
+
+    - name: Save 'build' folder
+      uses: actions/upload-artifact@v2
+      with:
+        name: the-frontend-build
+        if-no-files-found: error
+        path: frontend/app/build
+        retention-days: 1
+
+
+
+
+
+
+
+
+  backend-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Restore 'node_modules'
+      id: backend-nodejs-restore
+      uses: actions/cache/restore@v3
+      with:
+        path: backend/app/node_modules
+        key: ${{ runner.os }}-${{ hashFiles('backend/app/package.json') }}
+
+    - name: Install dependencies
+      working-directory: backend/app
+      run: npm install
+
+    - name: Cache 'node_modules'
+      id: backend-nodejs-save
+      uses: actions/cache/save@v3
+      with:
+        path: backend/app/node_modules
+        key:  ${{ runner.os }}-${{ hashFiles('backend/app/package.json') }}
+
+    - name: Build 
+      working-directory: backend/app
+      run: npm run build
+
+    - name: Save 'build' folder
+      uses: actions/upload-artifact@v2
+      with:
+        name: the-backend-build
+        if-no-files-found: error
+        path: backend/app/build
+        retention-days: 1
+
+
+  job_checker:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    outputs:
+      frontend_changed: ${{ steps.frontend_changed.outputs.frontend_changed }}
+      backend_changed: ${{ steps.backend_changed.outputs.backend_changed }}
+      ci_index: ${{ steps.calculate_ci_index.outputs.ci_index }}
+    steps:
+      - uses: dorny/paths-filter@v2
+        id: cf
+        with:
+          filters: |
+            src:
+              - 'frontend/**'
+              - 'shared/**'
+      - if: steps.cf.outputs.src == 'true'
+        id: frontend_changed
+        run: |
+          echo "frontend_changed=true" >> $GITHUB_OUTPUT
+      - uses: dorny/paths-filter@v2
+        id: cf2
+        with:
+          filters: |
+            src:
+              - 'backend/**'
+              - 'db/**'
+              - 'shared/**'
+      - if: steps.cf2.outputs.src == 'true'
+        id: backend_changed
+        run: |
+          echo "backend_changed=true" >> $GITHUB_OUTPUT
+      
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Calculate ci_index array
+        id: calculate_ci_index
+        run: | 
+          tests=($(ls frontend/app/cypress/e2e/*))
+
+          # Use a loop to print each element of the array
+          comma_separated_array="["
+          for test in "${tests[@]}"; do
+              filename=$(basename "$test")  # Extract the filename without the path
+              comma_separated_array+=" '$filename',"
+          done
+          comma_separated_array="${comma_separated_array%,}" # Remove the trailing comma
+          comma_separated_array+=" ]"
+
+          echo "ci_index=$comma_separated_array" >> $GITHUB_OUTPUT
+
+
+  cypress-e2e:
+    runs-on: ubuntu-latest
+    needs: [backend-build, frontend-build, job_checker, initialize-db] 
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ci_index: ${{ fromJson(needs.job_checker.outputs.ci_index) }}
+        browsers: [chrome] # edge, firfox
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Download 'build' artifact (backend)
+      uses: actions/download-artifact@v3
+      with:
+        name: the-backend-build
+        path: backend/app/build
+
+    - name: Download 'build' artifact (frontend)
+      uses: actions/download-artifact@v3
+      with:
+        name: the-frontend-build
+        path: frontend/app/build
+
+    - name: Restore 'node_modules' backend 
+      id: backend-nodejs-restore
+      uses: actions/cache/restore@v3
+      with:
+        path: backend/app/node_modules
+        key: ${{ runner.os }}-${{ hashFiles('backend/app/package.json') }}
+
+    - name: Restore 'node_modules' frontend
+      id: frontend-react-restore
+      uses: actions/cache/restore@v3
+      with:
+        path: frontend/app/node_modules
+        key: ${{ runner.os }}-${{ hashFiles('frontend/app/package.json') }}
+
+    - name: Run server
+      working-directory: backend/app
+      env:
+        SQL_DB: ${{ needs.initialize-db.outputs.SQL_DB }}
+      run: npm start &
+
+    - name: Install serve
+      working-directory: frontend/app
+      run: npm install -g serve
+
+    # Documentation: https://github.com/cypress-io/github-action
+    - name: Cypress run
+      uses: cypress-io/github-action@v6
+      env:
+        SQL_DB: ${{ needs.initialize-db.outputs.SQL_DB }}
+        # CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+        # CYPRESS_PROJECT_ID: ${{ secrets.CYPRESS_PROJECT_ID }}
+        # GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        # record: true
+        browser: ${{matrix.browsers}}
+        spec: cypress/e2e/${{matrix.ci_index}}
+        working-directory: frontend/app
+        wait-on: 'http://localhost:3000'
+        wait-on-timeout: 90
+        start: |
+          serve -s build
+
+
+  frontend-unit-testing:
+    runs-on: ubuntu-latest
+    needs: [frontend-build, job_checker]
+    if: ${{ needs.job_checker.outputs.frontend_changed == 'true'}}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Restore 'node_modules'
+      id: frontend-react-restore
+      uses: actions/cache/restore@v3
+      with:
+        path: frontend/app/node_modules
+        key: ${{ runner.os }}-${{ hashFiles('frontend/app/package.json') }}
+
+    - name: Testing using React-Testing Library
+      working-directory: frontend/app
+      run: npm run test-jest
+  
+
+
+  backend-postman-testing:
+    runs-on: ubuntu-latest
+    needs: [backend-build, initialize-db, job_checker]
+    if: ${{ needs.job_checker.outputs.backend_changed == 'true'}}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Download 'build' artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: the-backend-build
+        path: backend/app/build
+
+    - name: Restore 'node_modules'
+      id: backend-nodejs-restore
+      uses: actions/cache/restore@v3
+      with:
+        path: backend/app/node_modules
+        key: ${{ runner.os }}-${{ hashFiles('backend/app/package.json') }}
+
+    - name: Run server
+      working-directory: backend/app
+      env:
+        SQL_DB: ${{ needs.initialize-db.outputs.SQL_DB }}
+      run: |
+        npm start &
+
+    - name: Wait for Health Check
+      id: wait-for-health-check
+      run: |
+        sleep 5 # Adjust the sleep interval as needed
+
+    - name: Run API Tests
+      uses: matt-ball/newman-action@master
+      with:
+        collection: backend/MonoRepo.postman_collection.json
